@@ -4,7 +4,6 @@ class SPFChecker {
         this.domainInput = document.getElementById('domainInput');
         this.checkButton = document.getElementById('checkButton');
         this.resultsDiv = document.getElementById('results');
-
         this.init();
     }
 
@@ -14,7 +13,6 @@ class SPFChecker {
             this.checkSPF();
         });
 
-        // Example domain buttons
         document.querySelectorAll('.example-btn').forEach(btn => {
             btn.addEventListener('click', (e) => {
                 this.domainInput.value = e.target.getAttribute('data-domain');
@@ -22,14 +20,16 @@ class SPFChecker {
             });
         });
 
-        // Clear results when input changes
         this.domainInput.addEventListener('input', () => {
             if (this.resultsDiv.innerHTML) {
                 this.resultsDiv.style.opacity = '0.5';
             }
         });
 
-        // Keyboard shortcuts
+        this.domainInput.addEventListener('blur', () => {
+            this.domainInput.value = this.domainInput.value.trim();
+        });
+
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape' && this.resultsDiv.innerHTML) {
                 this.clearResults();
@@ -39,7 +39,13 @@ class SPFChecker {
     }
 
     async checkSPF() {
-        const domain = this.domainInput.value.trim().toLowerCase();
+        let domain = this.domainInput.value.trim().toLowerCase();
+        this.domainInput.value = domain;
+
+        if (!domain) {
+            this.showError('Please enter a domain name');
+            return;
+        }
 
         if (!this.validateDomain(domain)) {
             this.showError('Please enter a valid domain name', 'Domain must be in the format: example.com');
@@ -55,58 +61,39 @@ class SPFChecker {
             if (spfRecords.length === 0) {
                 this.showError(
                     `No SPF record found for ${domain}`,
-                    'This domain does not have an SPF record configured. Email authentication may not be properly set up.'
+                    'This domain does not have an SPF record configured.'
                 );
             } else {
                 await this.displayResults(domain, spfRecords);
             }
         } catch (error) {
-            this.showError(
-                `Error checking SPF: ${error.message}`,
-                'Please verify the domain name is correct and try again.'
-            );
+            this.showError(`Error checking SPF: ${error.message}`, 'Please verify the domain name is correct and try again.');
         } finally {
             this.checkButton.disabled = false;
         }
     }
 
     validateDomain(domain) {
+        if (!domain) return false;
         const domainRegex = /^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
         return domainRegex.test(domain);
     }
 
     async fetchSPFRecords(domain) {
-        // Using Google DNS over HTTPS API
         const response = await fetch(
             `https://dns.google/resolve?name=${encodeURIComponent(domain)}&type=TXT`,
-            {
-                headers: {
-                    'Accept': 'application/dns-json'
-                }
-            }
+            { headers: { 'Accept': 'application/dns-json' } }
         );
 
-        if (!response.ok) {
-            throw new Error(`DNS lookup failed: ${response.statusText}`);
-        }
-
+        if (!response.ok) throw new Error(`DNS lookup failed: ${response.statusText}`);
         const data = await response.json();
+        if (data.Status !== 0) throw new Error('DNS query failed - domain may not exist');
+        if (!data.Answer) return [];
 
-        if (data.Status !== 0) {
-            throw new Error('DNS query failed - domain may not exist');
-        }
-
-        if (!data.Answer) {
-            return [];
-        }
-
-        // Filter for SPF records (TXT records starting with "v=spf1")
-        const spfRecords = data.Answer
-            .filter(record => record.type === 16) // TXT records
-            .map(record => record.data.replace(/^"|"$/g, '')) // Remove quotes
+        return data.Answer
+            .filter(record => record.type === 16)
+            .map(record => record.data.replace(/^"|"$/g, ''))
             .filter(record => record.startsWith('v=spf1'));
-
-        return spfRecords;
     }
 
     async fetchIncludedDomain(domain) {
@@ -118,18 +105,32 @@ class SPFChecker {
         }
     }
 
-    calculateDNSLookups(spfRecord) {
+    async countDNSLookups(spfRecord, visited = new Set(), depth = 0) {
+        if (depth > 10) return 0;
+
         let count = 0;
+        const includeMatches = spfRecord.match(/include:([^\s]+)/g) || [];
+        const includeDomains = includeMatches.map(m => m.replace('include:', ''));
 
-        // Count include mechanisms
-        count += (spfRecord.match(/include:/g) || []).length;
-
-        // Count redirect mechanisms
+        count += includeMatches.length;
         count += (spfRecord.match(/redirect=/g) || []).length;
+        count += (spfRecord.match(/\ba\b/g) || []).length;
+        count += (spfRecord.match(/\bmx\b/g) || []).length;
+        count += (spfRecord.match(/\bptr\b/g) || []).length;
+        count += (spfRecord.match(/exists:/g) || []).length;
 
-        // Count a, mx, ptr, exists mechanisms (each requires DNS lookup)
-        const mechanismMatches = spfRecord.match(/\b(a|mx|ptr|exists)(:|\s|$)/g) || [];
-        count += mechanismMatches.length;
+        for (const domain of includeDomains) {
+            if (visited.has(domain)) continue;
+            visited.add(domain);
+
+            try {
+                const records = await this.fetchSPFRecords(domain);
+                if (records.length > 0) {
+                    const nestedCount = await this.countDNSLookups(records[0], visited, depth + 1);
+                    count += nestedCount;
+                }
+            } catch (err) {}
+        }
 
         return count;
     }
@@ -155,31 +156,26 @@ class SPFChecker {
     highlightMechanisms(spfRecord) {
         let highlighted = spfRecord;
 
-        // Highlight include: directives with tooltip
         highlighted = highlighted.replace(
             /include:([\S]+)/g, 
             (match, domain) => `<span class="mechanism include" data-domain="${domain}" title="${this.getMechanismExplanation('include:')}">include:${domain}<span class="mechanism-tooltip">${this.getMechanismExplanation('include:')}</span></span>`
         );
 
-        // Highlight redirect= directives with tooltip
         highlighted = highlighted.replace(
             /redirect=([\S]+)/g, 
             (match, domain) => `<span class="mechanism redirect" data-domain="${domain}" title="${this.getMechanismExplanation('redirect=')}">redirect=${domain}<span class="mechanism-tooltip">${this.getMechanismExplanation('redirect=')}</span></span>`
         );
 
-        // Highlight IP addresses with tooltip
         highlighted = highlighted.replace(
             /ip([46]):([\S]+)/g, 
             (match, version, addr) => `<span class="mechanism ip" title="${this.getMechanismExplanation('ip' + version + ':')}">ip${version}:${addr}<span class="mechanism-tooltip">${this.getMechanismExplanation('ip' + version + ':')}</span></span>`
         );
 
-        // Highlight all mechanism with tooltip
         highlighted = highlighted.replace(
             /([~\-?+]?all)/g, 
             (match) => `<span class="mechanism all" title="${this.getMechanismExplanation(match)}">${match}<span class="mechanism-tooltip">${this.getMechanismExplanation(match)}</span></span>`
         );
 
-        // Highlight other mechanisms
         highlighted = highlighted.replace(
             /\b(a|mx|ptr|exists)(:|\s|$)/g,
             (match, mech, suffix) => `<span class="mechanism ip" title="${this.getMechanismExplanation(mech)}">${mech}${suffix}<span class="mechanism-tooltip">${this.getMechanismExplanation(mech)}</span></span>`
@@ -191,7 +187,6 @@ class SPFChecker {
     extractIncludes(spfRecord) {
         const includeRegex = /include:([\S]+)/g;
         const redirectRegex = /redirect=([\S]+)/g;
-
         const includes = [];
         let match;
 
@@ -209,17 +204,23 @@ class SPFChecker {
     async displayResults(domain, spfRecords) {
         this.resultsDiv.style.opacity = '1';
 
-        const includesFound = [];
+        this.resultsDiv.innerHTML = `
+            <div class="loading">
+                <div class="spinner"></div>
+                <p>Calculating DNS lookups...</p>
+            </div>
+        `;
 
-        spfRecords.forEach(record => {
-            const recordIncludes = this.extractIncludes(record);
-            includesFound.push(...recordIncludes);
-        });
+        let totalDNSLookups = 0;
+        try {
+            totalDNSLookups = await this.countDNSLookups(spfRecords[0]);
+        } catch (error) {
+            console.error('DNS lookup calculation error:', error);
+            totalDNSLookups = (spfRecords[0].match(/include:/g) || []).length;
+        }
 
-        // Calculate total DNS lookups
-        const totalDNSLookups = spfRecords.reduce((sum, record) => {
-            return sum + this.calculateDNSLookups(record);
-        }, 0);
+        const includesFound = this.extractIncludes(spfRecords[0]);
+        const mechanisms = spfRecords[0].split(' ').length - 1;
 
         let html = `
             <div class="success">
@@ -227,8 +228,8 @@ class SPFChecker {
             </div>
         `;
 
-        // Warning for too many DNS lookups
-        if (totalDNSLookups > 10) {
+        // WARNING BOX - Shows if > 8 lookups
+        if (totalDNSLookups > 8) {
             html += `
                 <div class="warning">
                     <strong>⚠️ Warning:</strong> This SPF record requires <strong>${totalDNSLookups} DNS lookups</strong>. 
@@ -242,7 +243,6 @@ class SPFChecker {
             const record = spfRecords[i];
             const highlighted = this.highlightMechanisms(record);
             const includes = this.extractIncludes(record);
-            const dnsLookups = this.calculateDNSLookups(record);
 
             html += `
                 <div class="spf-record">
@@ -264,10 +264,6 @@ class SPFChecker {
             `;
         }
 
-        // Add statistics
-        const totalIncludes = includesFound.length;
-        const mechanisms = spfRecords[0].split(' ').length - 1;
-
         html += `
             <div class="stats">
                 <div class="stat-card">
@@ -275,12 +271,12 @@ class SPFChecker {
                     <div class="stat-label">SPF Records</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-value">${totalIncludes}</div>
+                    <div class="stat-value">${includesFound.length}</div>
                     <div class="stat-label">Includes/Redirects</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-value ${totalDNSLookups > 10 ? 'warning' : ''}">${totalDNSLookups}</div>
-                    <div class="stat-label">DNS Lookups ${totalDNSLookups > 10 ? '⚠️' : ''}</div>
+                    <div class="stat-value ${totalDNSLookups > 8 ? 'warning' : ''}">${totalDNSLookups}</div>
+                    <div class="stat-label">DNS Lookups ${totalDNSLookups > 8 ? '⚠️' : ''}</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-value">${mechanisms}</div>
@@ -289,7 +285,6 @@ class SPFChecker {
             </div>
         `;
 
-        // Add info box
         html += `
             <div class="info-box">
                 <strong>💡 Tips:</strong><br>
@@ -298,19 +293,12 @@ class SPFChecker {
                 • Keep DNS lookups under 10 to avoid delivery issues<br>
                 • Use the copy button to copy the SPF record
             </div>
-            <button class="clear-btn" onclick="document.querySelector('.spf-checker').clearResults()">Clear Results</button>
+            <button class="clear-btn" onclick="window.spfChecker.clearResults()">Clear Results</button>
         `;
 
         this.resultsDiv.innerHTML = html;
-
-        // Add click handlers for include/redirect mechanisms
         this.attachIncludeHandlers();
-
-        // Add copy button handlers
         this.attachCopyHandlers();
-
-        // Store reference for clear button
-        document.querySelector('.spf-checker').clearResults = () => this.clearResults();
     }
 
     attachCopyHandlers() {
@@ -323,7 +311,6 @@ class SPFChecker {
                     const originalText = e.target.innerHTML;
                     e.target.innerHTML = '✓ Copied!';
                     e.target.classList.add('copied');
-
                     setTimeout(() => {
                         e.target.innerHTML = originalText;
                         e.target.classList.remove('copied');
@@ -350,14 +337,12 @@ class SPFChecker {
 
                 if (!includesContent) return;
 
-                // Check if already loaded
                 const existingItem = includesContent.querySelector(`[data-domain="${domain}"]`);
                 if (existingItem) {
                     existingItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
                     return;
                 }
 
-                // Add loading state
                 const loadingDiv = document.createElement('div');
                 loadingDiv.className = 'include-item';
                 loadingDiv.innerHTML = `
@@ -365,7 +350,6 @@ class SPFChecker {
                     <div class="include-loading">Loading SPF record...</div>
                 `;
 
-                // Remove placeholder text if exists
                 const placeholder = includesContent.querySelector('.include-loading');
                 if (placeholder && placeholder.textContent.includes('Click on')) {
                     includesContent.innerHTML = '';
@@ -373,7 +357,6 @@ class SPFChecker {
 
                 includesContent.appendChild(loadingDiv);
 
-                // Fetch the included domain's SPF record
                 const spfRecord = await this.fetchIncludedDomain(domain);
 
                 loadingDiv.setAttribute('data-domain', domain);
@@ -423,10 +406,7 @@ class SPFChecker {
     }
 }
 
-// Initialize the app
 document.addEventListener('DOMContentLoaded', () => {
     const checker = new SPFChecker();
-    // Store reference globally for clear button
-    document.querySelector('.container').classList.add('spf-checker');
     window.spfChecker = checker;
 });
